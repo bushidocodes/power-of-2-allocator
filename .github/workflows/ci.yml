@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: windows-latest
+            name: Windows
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc make
+
+      - name: Set up MSYS2 with GCC and make (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc make
+
+      - name: Unit tests (Linux)
+        if: runner.os == 'Linux'
+        run: make test
+
+      - name: Integration tests (Linux)
+        if: runner.os == 'Linux'
+        run: make run
+
+      - name: Unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make test
+
+      - name: Integration tests (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: make run
