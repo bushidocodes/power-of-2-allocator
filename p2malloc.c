@@ -42,14 +42,17 @@ struct p2freelist_node {
 };
 
 /*
- * Block sizes: 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 bytes.
+ * Block sizes: 32, 64, 128, 256, 512, 1024, 2048, 4096 bytes.
  *
- * The xv6 version started at 16 bytes (2^4).  On a 64-bit host,
- * sizeof(struct p2freelist_node) == 24 bytes, so a 16-byte block cannot hold
- * the freelist metadata.  Starting at 32 bytes (2^5) fixes this while keeping
- * the same number of buckets and supporting requests up to ~8188 bytes.
+ * The xv6 version used 9 buckets starting at 16 bytes (2^4).  On a 64-bit
+ * host, sizeof(struct p2freelist_node) == 24 bytes, so a 16-byte block cannot
+ * hold the freelist metadata.  Starting at 32 bytes (2^5) fixes this.
+ *
+ * We keep 8 buckets so the largest block (4096 bytes) still fits exactly in
+ * one page — the same invariant as the original.  A 9th bucket at 8192 bytes
+ * would overrun the 4096-byte sbrk region used to carve it.
  */
-#define NUM_FREELISTS 9
+#define NUM_FREELISTS 8
 #define BASE_SHIFT    5 /* minimum block = 2^5 = 32 bytes */
 
 static int was_init = 0;
@@ -80,8 +83,7 @@ static int get_freelist_idx(int size)
 {
 	if (size <= 0) return -1;
 	int swh = size + (int)sizeof(struct p2header);
-	if      (swh > 8192) return -1;
-	else if (swh > 4096) return 8;
+	if      (swh > 4096) return -1;
 	else if (swh > 2048) return 7;
 	else if (swh > 1024) return 6;
 	else if (swh > 512)  return 5;

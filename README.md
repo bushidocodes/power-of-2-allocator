@@ -18,7 +18,6 @@ The allocator maintains **9 segregated free lists**, one per power-of-2 block si
 | 5 | 1 024 B | 1 020 B |
 | 6 | 2 048 B | 2 044 B |
 | 7 | 4 096 B | 4 092 B |
-| 8 | 8 192 B | 8 188 B |
 
 Each allocation prepends a 4-byte header storing the requested size, then returns a pointer to the payload. On `p2free`, the header is used to locate the correct free list and the block is reinserted in address order (which sets up for future coalescing).
 
