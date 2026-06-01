@@ -4,6 +4,9 @@
 
 /* Each level was a separate program in xv6; p2reset() restores that isolation. */
 
+/* %zu isn't recognized by all MinGW printf implementations; cast to ull */
+#define SZ(x) ((unsigned long long)(x))
+
 /* ------------------------------------------------------------------ */
 /* Level 0: smoke test — one alloc, one free                          */
 /* ------------------------------------------------------------------ */
@@ -13,8 +16,8 @@ static int test_level0(void)
 	void *addr = p2malloc(100);
 	if (!addr) { printf("  FAIL: p2malloc returned NULL\n"); return 0; }
 	p2free(addr);
-	printf("  Allocated : %d\n", p2allocated());
-	printf("  Total Mem : %d\n", p2totmem());
+	printf("  Allocated : %llu\n", SZ(p2allocated()));
+	printf("  Total Mem : %llu\n", SZ(p2totmem()));
 	printf("  PASS\n\n");
 	return 1;
 }
@@ -41,7 +44,7 @@ static int test_level1(void)
 static int test_level2(void)
 {
 	printf("Level 2: 8 live 12-byte allocs, out-of-order free, zeroing check\n");
-	const int size = 12;
+	const size_t size = 12;
 	void *ptrs[8];
 
 	for (int i = 0; i < 8; i++) {
@@ -49,14 +52,14 @@ static int test_level2(void)
 		if (!ptrs[i]) { printf("  FAIL: p2malloc returned NULL at i=%d\n", i); return 0; }
 
 		if (p2totmem() != 4096) {
-			printf("  FAIL: totmem should be 4096 after alloc %d, got %d\n",
-			       i + 1, p2totmem());
+			printf("  FAIL: totmem should be 4096 after alloc %d, got %llu\n",
+			       i + 1, SZ(p2totmem()));
 			return 0;
 		}
-		int got = p2allocated();
-		int want = size * (i + 1);
-		if (got != want) {
-			printf("  FAIL: allocated should be %d, got %d\n", want, got);
+		size_t want = size * (size_t)(i + 1);
+		if (p2allocated() != want) {
+			printf("  FAIL: allocated should be %llu, got %llu\n",
+			       SZ(want), SZ(p2allocated()));
 			return 0;
 		}
 	}
@@ -93,11 +96,11 @@ static int test_level3(void)
 {
 	printf("Level 3: sweep sizes 12..4091 step 7 (no frees)\n");
 	for (int size = 12; size < 4092; size += 7) {
-		void *p = p2malloc(size);
+		void *p = p2malloc((size_t)size);
 		if (!p) { printf("  FAIL: p2malloc(%d) returned NULL\n", size); return 0; }
 	}
-	printf("  Allocated : %d\n", p2allocated());
-	printf("  Total Mem : %d\n", p2totmem());
+	printf("  Allocated : %llu\n", SZ(p2allocated()));
+	printf("  Total Mem : %llu\n", SZ(p2totmem()));
 	printf("  PASS\n\n");
 	return 1;
 }
@@ -117,8 +120,8 @@ static int test_level4(void)
 		memset(thing, 0, 12);
 		if (i >= gate) p2free(thing);
 	}
-	printf("  After 12-byte phase  — allocated: %d  totmem: %d\n",
-	       p2allocated(), p2totmem());
+	printf("  After 12-byte phase  — allocated: %llu  totmem: %llu\n",
+	       SZ(p2allocated()), SZ(p2totmem()));
 
 	for (int i = 0; i < 1000000; i++) {
 		void *thing = p2malloc(300);
@@ -126,8 +129,8 @@ static int test_level4(void)
 		memset(thing, 0, 300);
 		if (i >= gate) p2free(thing);
 	}
-	printf("  After 300-byte phase — allocated: %d  totmem: %d\n",
-	       p2allocated(), p2totmem());
+	printf("  After 300-byte phase — allocated: %llu  totmem: %llu\n",
+	       SZ(p2allocated()), SZ(p2totmem()));
 	printf("  PASS\n\n");
 	return 1;
 }

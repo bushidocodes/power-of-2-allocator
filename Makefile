@@ -1,5 +1,12 @@
-CC      = gcc
-CFLAGS  = -Wall -Wextra -std=c11 -O2
+CC     = gcc
+CFLAGS = -Wall -Wextra -std=c11 -O2
+
+# Link pthreads on POSIX; Windows uses native SRWLOCK (no extra lib needed)
+ifeq ($(OS),Windows_NT)
+    LDFLAGS =
+else
+    LDFLAGS = -lpthread
+endif
 
 TARGET      = p2test
 TEST_TARGET = test_p2malloc
@@ -10,10 +17,10 @@ ALLOCATOR_OBJS = $(ALLOCATOR_SRCS:.c=.o)
 all: $(TARGET)
 
 $(TARGET): main.o $(ALLOCATOR_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(TEST_TARGET): test_p2malloc.o $(ALLOCATOR_OBJS) unity/unity.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 unity/unity.o: unity/unity.c unity/unity.h unity/unity_internals.h
 	$(CC) $(CFLAGS) -c -o $@ $<

@@ -1,175 +1,324 @@
+/*
+ * p2malloc — power-of-2 slab allocator with OS fallback for large requests.
+ *
+ * Slab layer  : 8 segregated free lists for block sizes 32–4096 bytes.
+ *               Each list is protected by its own mutex.
+ * Large layer : allocations above P2_SLAB_MAX go straight to the OS via
+ *               mmap (POSIX) or VirtualAlloc (Windows) and are returned
+ *               to the OS on free.
+ * Alignment   : every returned pointer is aligned to __BIGGEST_ALIGNMENT__
+ *               (16 bytes on this platform) by sizing the header to that
+ *               boundary.
+ * Thread safety: per-freelist mutex; global counters use C11 atomics.
+ */
+
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include "ps_list.h"
 #include "p2malloc.h"
 
-/*
- * Simulates sbrk() using a static backing buffer.
- *
- * The original xv6 implementation called sbrk(4096) to grow the heap one page
- * at a time.  sbrk() is not available on Windows, so we maintain a monotonically
- * advancing pointer into a large static array instead.  The semantics are
- * identical: each call returns a fresh, non-overlapping 4096-byte region, or
- * (void*)-1 on exhaustion.
- */
-#define BACKING_HEAP_SIZE (16 * 1024 * 1024) /* 16 MB */
-static char   backing_heap[BACKING_HEAP_SIZE];
-static size_t heap_offset = 0;
+/* ------------------------------------------------------------------ */
+/* Platform: OS memory and mutual exclusion                            */
+/* ------------------------------------------------------------------ */
 
-static void *fake_sbrk(int n)
+#ifdef _WIN32
+#  include <windows.h>
+
+static void *os_alloc(size_t n)
 {
-	if (n <= 0 || (size_t)n > BACKING_HEAP_SIZE - heap_offset) return (void *)-1;
-	void *ptr  = backing_heap + heap_offset;
-	heap_offset += (size_t)n;
-	return ptr;
+    return VirtualAlloc(NULL, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+
+static void os_free(void *p, size_t n)
+{
+    (void)n;
+    VirtualFree(p, 0, MEM_RELEASE);
+}
+
+typedef SRWLOCK p2_mutex_t;
+#define MUTEX_INIT(m)   InitializeSRWLock(&(m))
+#define MUTEX_LOCK(m)   AcquireSRWLockExclusive(&(m))
+#define MUTEX_UNLOCK(m) ReleaseSRWLockExclusive(&(m))
+
+#else /* POSIX */
+#  include <sys/mman.h>
+#  include <pthread.h>
+
+static void *os_alloc(size_t n)
+{
+    void *p = mmap(NULL, n, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+static void os_free(void *p, size_t n)
+{
+    munmap(p, n);
+}
+
+typedef pthread_mutex_t p2_mutex_t;
+#define MUTEX_INIT(m)   pthread_mutex_init(&(m), NULL)
+#define MUTEX_LOCK(m)   pthread_mutex_lock(&(m))
+#define MUTEX_UNLOCK(m) pthread_mutex_unlock(&(m))
+
+#endif /* _WIN32 */
+
+/* ------------------------------------------------------------------ */
+/* Allocation header                                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Sits immediately before the pointer returned to the caller.
+ * Aligned to __BIGGEST_ALIGNMENT__ so that header + sizeof(p2header)
+ * keeps every returned pointer naturally aligned.
+ */
+typedef struct {
+    size_t size;       /* user-requested allocation size */
+    size_t alloc_size; /* 0 = slab block; non-zero = bytes from OS (large) */
+} __attribute__((aligned(__BIGGEST_ALIGNMENT__))) p2header;
+
+_Static_assert(sizeof(p2header) == P2_HEADER_SIZE,
+               "p2header size must equal P2_HEADER_SIZE");
+
+#define IS_LARGE(h) ((h)->alloc_size != 0)
+
+/* Round n up to the next 4096-byte boundary */
+static size_t page_align(size_t n)
+{
+    return (n + 4095) & ~(size_t)4095;
 }
 
 /* ------------------------------------------------------------------ */
+/* Slab allocator state                                                */
+/* ------------------------------------------------------------------ */
 
-struct p2header {
-	int pow2; /* stores the user-requested allocation size */
-};
+/*
+ * Block sizes: 32, 64, 128, 256, 512, 1024, 2048, 4096 bytes  (2^5 – 2^12).
+ * Minimum 32 B: sizeof(p2freelist_node) == 24 on 64-bit, so any block ≥ 32
+ * can hold the freelist metadata while on the free list.
+ * Maximum 4096 B: the largest block fits exactly in one OS page.
+ */
+#define NUM_FREELISTS 8
+#define BASE_SHIFT    5
+#define PAGE_BYTES    4096
 
 struct p2freelist_head {
-	int pow2; /* block size managed by this list */
-	struct ps_list_head list_head;
+    int                 pow2;
+    struct ps_list_head list_head;
+    p2_mutex_t          lock;
 };
 
 struct p2freelist_node {
-	int pow2; /* block size (when on freelist) or user size (when allocated) */
-	struct ps_list list;
+    /* list MUST be first so both pointers (bytes 0–15) stay inside the
+     * header region and never overlap with user data (bytes 16+). */
+    struct ps_list list;
+    int            pow2;
 };
 
-/*
- * Block sizes: 32, 64, 128, 256, 512, 1024, 2048, 4096 bytes.
- *
- * The xv6 version used 9 buckets starting at 16 bytes (2^4).  On a 64-bit
- * host, sizeof(struct p2freelist_node) == 24 bytes, so a 16-byte block cannot
- * hold the freelist metadata.  Starting at 32 bytes (2^5) fixes this.
- *
- * We keep 8 buckets so the largest block (4096 bytes) still fits exactly in
- * one page — the same invariant as the original.  A 9th bucket at 8192 bytes
- * would overrun the 4096-byte sbrk region used to carve it.
- */
-#define NUM_FREELISTS 8
-#define BASE_SHIFT    5 /* minimum block = 2^5 = 32 bytes */
-
-static int was_init = 0;
-static int allocated = 0; /* sum of all live user-requested sizes */
-static int totmem    = 0; /* total bytes obtained from fake_sbrk */
+static _Atomic int    init_state = 0;  /* 0 = uninit, 1 = initing, 2 = ready */
+static _Atomic size_t allocated  = 0;
+static _Atomic size_t totmem     = 0;
 static struct p2freelist_head freelists[NUM_FREELISTS];
-
-static int idx_to_blocksize(int idx)
-{
-	return 1 << (idx + BASE_SHIFT);
-}
 
 static void freelists_init(void)
 {
-	for (int i = 0; i < NUM_FREELISTS; i++) {
-		ps_list_head_init(&freelists[i].list_head);
-		freelists[i].pow2 = idx_to_blocksize(i);
-	}
-	was_init = 1;
+    for (int i = 0; i < NUM_FREELISTS; i++) {
+        ps_list_head_init(&freelists[i].list_head);
+        freelists[i].pow2 = 1 << (i + BASE_SHIFT);
+        MUTEX_INIT(freelists[i].lock);
+    }
+}
+
+static void ensure_init(void)
+{
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&init_state, &expected, 1)) {
+        freelists_init();
+        atomic_store(&init_state, 2);
+    } else {
+        while (atomic_load(&init_state) != 2)
+            ; /* spin — init is fast, no sleep needed */
+    }
 }
 
 /*
- * Returns the freelist index for a request of `size` bytes.
- * The index is the smallest bucket whose block fits both the header and the
- * user payload.  Returns -1 if size is out of range.
+ * Map a user-requested size to a freelist index.
+ * Returns -1 when size + header exceeds one page (caller uses large path).
  */
-static int get_freelist_idx(int size)
+static int get_freelist_idx(size_t size)
 {
-	if (size <= 0) return -1;
-	int swh = size + (int)sizeof(struct p2header);
-	if      (swh > 4096) return -1;
-	else if (swh > 2048) return 7;
-	else if (swh > 1024) return 6;
-	else if (swh > 512)  return 5;
-	else if (swh > 256)  return 4;
-	else if (swh > 128)  return 3;
-	else if (swh > 64)   return 2;
-	else if (swh > 32)   return 1;
-	else                 return 0;
-}
-
-void *p2malloc(int size)
-{
-	if (!was_init) freelists_init();
-
-	int idx = get_freelist_idx(size);
-	if (idx == -1) return NULL;
-
-	struct p2freelist_head *freelist = &freelists[idx];
-
-	if (ps_list_head_empty(&freelist->list_head)) {
-		void *page = fake_sbrk(4096);
-		if (page == (void *)-1) return NULL;
-
-		totmem += 4096;
-		for (char *addr = (char *)page; addr < (char *)page + 4096; addr += freelist->pow2) {
-			struct p2freelist_node *node = (struct p2freelist_node *)addr;
-			ps_list_init_d(node);
-			node->pow2 = freelist->pow2;
-			ps_list_head_add_d(&freelist->list_head, node);
-		}
-	}
-
-	if (ps_list_head_empty(&freelist->list_head)) {
-		fprintf(stderr, "Error: Failed to populate freelist\n");
-		return NULL;
-	}
-
-	struct p2freelist_node *first_free =
-		ps_list_head_first_d(&freelists[idx].list_head, struct p2freelist_node);
-	ps_list_rem_d(first_free);
-	memset(first_free, 0, sizeof(first_free->pow2));
-	((struct p2header *)first_free)->pow2 = size;
-	allocated += size;
-	return (char *)first_free + sizeof(struct p2header);
+    size_t swh = size + P2_HEADER_SIZE;
+    if      (swh > 4096) return -1;
+    else if (swh > 2048) return 7;
+    else if (swh > 1024) return 6;
+    else if (swh > 512)  return 5;
+    else if (swh > 256)  return 4;
+    else if (swh > 128)  return 3;
+    else if (swh > 64)   return 2;
+    else if (swh > 32)   return 1;
+    else                 return 0;
 }
 
 /*
- * Insert `node` into `freelist` in ascending address order.
- * Keeping the list sorted by address enables future coalescing and makes
- * debugging easier (blocks come back in a predictable sequence).
+ * Insert node into freelist in ascending address order.
+ *
+ * Ordering enables future coalescing.  We explicitly detect the sentinel
+ * head rather than relying on its address being numerically lowest — that
+ * assumption breaks when pages come from mmap/VirtualAlloc rather than a
+ * static array, since OS pages can land anywhere in virtual address space.
  */
-static void p2orderedinsert(struct p2freelist_node *node, struct p2freelist_head *freelist)
+static void p2orderedinsert(struct p2freelist_node *node,
+                            struct p2freelist_head *fl)
 {
-	if (ps_list_head_empty(&freelist->list_head)) {
-		ps_list_head_append_d(&freelist->list_head, node);
-	} else {
-		struct p2freelist_node *predecessor =
-			ps_list_head_last_d(&freelist->list_head, struct p2freelist_node);
-		for (; predecessor > node; predecessor = ps_list_prev_d(predecessor))
-			;
-		ps_list_add_d(predecessor, node);
-	}
+    if (ps_list_head_empty(&fl->list_head)) {
+        ps_list_head_append_d(&fl->list_head, node);
+        return;
+    }
+
+    struct p2freelist_node *cursor =
+        ps_list_head_last_d(&fl->list_head, struct p2freelist_node);
+
+    while (cursor > node) {
+        if (cursor->list.previous == &fl->list_head.list) {
+            /* node sorts before everything in the list */
+            ps_list_ll_add(&fl->list_head.list, &node->list);
+            return;
+        }
+        cursor = ps_list_prev_d(cursor);
+    }
+    ps_list_add_d(cursor, node);
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API                                                          */
+/* ------------------------------------------------------------------ */
+
+void *p2malloc(size_t size)
+{
+    if (size == 0) return NULL;
+    if (size > SIZE_MAX - P2_HEADER_SIZE) return NULL; /* overflow guard */
+    ensure_init();
+
+    int idx = get_freelist_idx(size);
+
+    /* --- Large allocation: bypass the slab, allocate directly from the OS --- */
+    if (idx == -1) {
+        size_t alloc_size = page_align(P2_HEADER_SIZE + size);
+        p2header *hdr = os_alloc(alloc_size);
+        if (!hdr) return NULL;
+        hdr->size       = size;
+        hdr->alloc_size = alloc_size;
+        atomic_fetch_add(&allocated, size);
+        atomic_fetch_add(&totmem, alloc_size);
+        return (char *)hdr + P2_HEADER_SIZE;
+    }
+
+    /* --- Slab allocation --- */
+    struct p2freelist_head *fl = &freelists[idx];
+    MUTEX_LOCK(fl->lock);
+
+    if (ps_list_head_empty(&fl->list_head)) {
+        void *page = os_alloc(PAGE_BYTES);
+        if (!page) { MUTEX_UNLOCK(fl->lock); return NULL; }
+        atomic_fetch_add(&totmem, PAGE_BYTES);
+        for (char *a = (char *)page; a < (char *)page + PAGE_BYTES; a += fl->pow2) {
+            struct p2freelist_node *n = (struct p2freelist_node *)a;
+            ps_list_init_d(n);
+            ps_list_head_add_d(&fl->list_head, n);
+        }
+    }
+
+    struct p2freelist_node *first =
+        ps_list_head_first_d(&fl->list_head, struct p2freelist_node);
+    ps_list_rem_d(first);
+    MUTEX_UNLOCK(fl->lock);
+
+    p2header *hdr = (p2header *)first;
+    hdr->size       = size;
+    hdr->alloc_size = 0; /* mark as slab-managed */
+    atomic_fetch_add(&allocated, size);
+    return (char *)hdr + P2_HEADER_SIZE;
 }
 
 void p2free(void *ptr)
 {
-	struct p2freelist_node *node =
-		(struct p2freelist_node *)((char *)ptr - sizeof(struct p2header));
-	allocated -= node->pow2;
-	memset(ptr, 0, sizeof(node->pow2)); /* zero first int of user data (use-after-free detection) */
-	struct p2freelist_head *freelist = &freelists[get_freelist_idx(node->pow2)];
-	p2orderedinsert(node, freelist);
+    if (!ptr) return; /* NULL is a no-op, matching standard free() */
+
+    p2header *hdr = (p2header *)((char *)ptr - P2_HEADER_SIZE);
+
+    if (IS_LARGE(hdr)) {
+        size_t size       = hdr->size;
+        size_t alloc_size = hdr->alloc_size;
+        atomic_fetch_sub(&allocated, size);
+        atomic_fetch_sub(&totmem,    alloc_size);
+        os_free(hdr, alloc_size);
+        return;
+    }
+
+    size_t size = hdr->size;
+    atomic_fetch_sub(&allocated, size);
+
+    /* Zero one pointer-width word at the start of the payload as a
+     * use-after-free tripwire (mirrors the original xv6 behaviour). */
+    memset(ptr, 0, sizeof(size_t));
+
+    int idx = get_freelist_idx(size);
+    struct p2freelist_head *fl = &freelists[idx];
+    struct p2freelist_node *node = (struct p2freelist_node *)hdr;
+
+    MUTEX_LOCK(fl->lock);
+    p2orderedinsert(node, fl);
+    MUTEX_UNLOCK(fl->lock);
 }
 
-int p2allocated(void) { return allocated; }
-int p2totmem(void)    { return totmem; }
+void *p2calloc(size_t nmemb, size_t size)
+{
+    if (nmemb == 0 || size == 0) return NULL;
+    if (nmemb > SIZE_MAX / size) return NULL; /* overflow guard */
+    void *p = p2malloc(nmemb * size);
+    if (p) memset(p, 0, nmemb * size);
+    return p;
+}
 
-/*
- * Reset all allocator state.  Needed when running multiple test levels in one
- * process; in the original xv6 assignment each level was a separate program.
- */
+void *p2realloc(void *ptr, size_t size)
+{
+    if (!ptr)      return p2malloc(size);
+    if (size == 0) { p2free(ptr); return NULL; }
+
+    p2header *hdr     = (p2header *)((char *)ptr - P2_HEADER_SIZE);
+    size_t    old_size = hdr->size;
+
+    /* Same slab bucket: update the header in-place, no copy needed */
+    if (!IS_LARGE(hdr) && get_freelist_idx(size) == get_freelist_idx(old_size)) {
+        atomic_fetch_sub(&allocated, old_size);
+        atomic_fetch_add(&allocated, size);
+        hdr->size = size;
+        return ptr;
+    }
+
+    void *new_ptr = p2malloc(size);
+    if (!new_ptr) return NULL;
+    memcpy(new_ptr, ptr, old_size < size ? old_size : size);
+    p2free(ptr);
+    return new_ptr;
+}
+
+size_t p2allocated(void) { return atomic_load(&allocated); }
+size_t p2totmem(void)    { return atomic_load(&totmem); }
+
 void p2reset(void)
 {
-	memset(backing_heap, 0, heap_offset);
-	heap_offset = 0;
-	was_init    = 0;
-	allocated   = 0;
-	totmem      = 0;
+    /* Re-initialise list heads and counters; preserve mutexes (already init'd).
+     * Previously claimed OS pages are abandoned and released at process exit. */
+    if (atomic_load(&init_state) == 2) {
+        for (int i = 0; i < NUM_FREELISTS; i++)
+            ps_list_head_init(&freelists[i].list_head);
+    } else {
+        freelists_init();
+        atomic_store(&init_state, 2);
+    }
+    atomic_store(&allocated, 0);
+    atomic_store(&totmem,    0);
 }
