@@ -2,7 +2,7 @@
 
 A power-of-2 memory allocator extracted from an xv6 kernel assignment and ported to a standalone userspace C program, then hardened for use in real applications.
 
-The original implementation lived inside a GWU operating systems course project ([hw6-19-power-of-2-malloc-bushidocodes](https://github.com/bushidocodes/hw6-19-power-of-2-malloc-bushidocodes)) and depended on xv6 kernel headers and the `sbrk` syscall stub. This repo strips all of that away and adds the features needed for production use.
+The original implementation lived inside a GWU operating systems course project and depended on xv6 kernel headers and the `sbrk` syscall stub. This repo strips all of that away and adds the features needed for production use.
 
 ## How it works
 
