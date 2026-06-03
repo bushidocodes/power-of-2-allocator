@@ -6,9 +6,9 @@
  * Large layer : allocations above P2_SLAB_MAX go straight to the OS via
  *               mmap (POSIX) or VirtualAlloc (Windows) and are returned
  *               to the OS on free.
- * Alignment   : every returned pointer is aligned to __BIGGEST_ALIGNMENT__
- *               (16 bytes on this platform) by sizing the header to that
- *               boundary.
+ * Alignment   : every returned pointer is aligned to _Alignof(max_align_t)
+ *               (16 bytes on most 64-bit platforms) by sizing the header to
+ *               that boundary.
  * Thread safety: per-freelist mutex; global counters use C11 atomics.
  */
 
@@ -72,13 +72,13 @@ typedef pthread_mutex_t p2_mutex_t;
 
 /*
  * Sits immediately before the pointer returned to the caller.
- * Aligned to __BIGGEST_ALIGNMENT__ so that header + sizeof(p2header)
- * keeps every returned pointer naturally aligned.
+ * Aligned to max_align_t so that header + sizeof(p2header) keeps every
+ * returned pointer naturally aligned.  Uses C11 _Alignas; no GCC extensions.
  */
 typedef struct {
-    size_t size;       /* user-requested allocation size */
-    size_t alloc_size; /* 0 = slab block; non-zero = bytes from OS (large) */
-} __attribute__((aligned(__BIGGEST_ALIGNMENT__))) p2header;
+    _Alignas(max_align_t) size_t size; /* user-requested allocation size */
+    size_t alloc_size;                 /* 0 = slab block; non-zero = bytes from OS (large) */
+} p2header;
 
 _Static_assert(sizeof(p2header) == P2_HEADER_SIZE,
                "p2header size must equal P2_HEADER_SIZE");
