@@ -5,10 +5,13 @@
 
 /*
  * Size of the header prepended to every allocation.
- * Set to __BIGGEST_ALIGNMENT__ so that the pointer returned to the caller
- * always satisfies the platform's maximum alignment requirement.
+ * Equals sizeof(p2header): 2*sizeof(size_t) rounded up to max_align_t
+ * alignment, so every returned pointer satisfies the platform's maximum
+ * alignment requirement.  Uses only C11 standard types/operators.
  */
-#define P2_HEADER_SIZE  ((size_t)__BIGGEST_ALIGNMENT__)
+#define P2_HEADER_SIZE \
+    (((size_t)2 * sizeof(size_t) + _Alignof(max_align_t) - 1) \
+     & ~(_Alignof(max_align_t) - 1))
 
 /*
  * Largest payload served by the slab allocator.
