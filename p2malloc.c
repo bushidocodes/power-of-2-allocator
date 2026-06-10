@@ -181,7 +181,7 @@ static void p2orderedinsert(struct p2freelist_node *node,
     struct p2freelist_node *cursor =
         ps_list_head_last_d(&fl->list_head, struct p2freelist_node);
 
-    while (cursor > node) {
+    while ((uintptr_t)cursor > (uintptr_t)node) {
         if (cursor->list.previous == &fl->list_head.list) {
             /* node sorts before everything in the list */
             ps_list_ll_add(&fl->list_head.list, &node->list);
