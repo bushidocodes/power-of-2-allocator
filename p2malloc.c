@@ -12,6 +12,7 @@
  * Thread safety: per-freelist mutex; global counters use C11 atomics.
  */
 
+#include <assert.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -266,6 +267,8 @@ void p2free(void *ptr)
     memset(ptr, 0, sizeof(size_t));
 
     int idx = get_freelist_idx(size);
+    assert(idx >= 0 && idx < NUM_FREELISTS);
+    if (idx < 0) return;
     struct p2freelist_head *fl = &freelists[idx];
     struct p2freelist_node *node = (struct p2freelist_node *)hdr;
 
