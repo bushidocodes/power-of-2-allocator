@@ -1,3 +1,4 @@
 *.o
 *.exe
 p2test
+test_p2malloc
