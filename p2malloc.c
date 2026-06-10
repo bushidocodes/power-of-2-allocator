@@ -268,7 +268,7 @@ void p2free(void *ptr)
 
     int idx = get_freelist_idx(size);
     assert(idx >= 0 && idx < NUM_FREELISTS);
-    if (idx < 0 || idx >= NUM_FREELISTS) return;
+    if (idx < 0) return;
     struct p2freelist_head *fl = &freelists[idx];
     struct p2freelist_node *node = (struct p2freelist_node *)hdr;
 
