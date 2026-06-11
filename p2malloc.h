@@ -29,7 +29,13 @@ size_t p2totmem(void);
 /*
  * Reset all allocator state.  Not thread-safe; call only when no other
  * threads are using the allocator.  Intended for use between test cases.
- * Previously claimed OS pages are abandoned (released at process exit).
+ *
+ * After p2reset(), p2allocated() returns 0 and p2totmem() returns 0, but
+ * slab pages claimed before the reset are NOT returned to the OS — they
+ * are abandoned and released at process exit.  p2totmem() therefore
+ * reflects only allocations made after the most recent p2reset(), not
+ * total OS memory held by the process.  Do not use p2totmem() across a
+ * reset boundary to measure peak or cumulative memory consumption.
  */
 void p2reset(void);
 
